@@ -110,6 +110,21 @@
         border-color: #106ebe;
     }
 
+    /* Datei oeffnen / SharePoint Browser */
+    .file-section {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 12px;
+        padding-top: 12px;
+        border-top: 1px solid #edebe9;
+        flex-wrap: wrap;
+    }
+
+    .divider-text {
+        color: #a19f9d;
+    }
+
     /* Favoriten Dropdown */
     .favorites-section {
         margin-top: 8px;
@@ -246,6 +261,17 @@
                 </button>
             </div>
 
+            <div class="file-section">
+                <span class="divider-text ms-font-s">or</span>
+                <button id="fileBtn" class="ms-Button">
+                    <span class="ms-Button-label">Open local file...</span>
+                </button>
+                <button id="spPickerBtn" class="ms-Button">
+                    <span class="ms-Button-label">Browse SharePoint...</span>
+                </button>
+                <input type="file" id="fileInput" accept=".html,.htm" style="display: none;">
+            </div>
+
             <div class="favorites-section">
                 <label class="ms-font-s">Recent:</label>
                 <select id="favorites" class="ms-Dropdown-select">
@@ -286,7 +312,9 @@
     const STORAGE_KEY = 'vizAddin_favorites';
     const SETTINGS_KEY = 'vizUrl';
     const LAST_URL_KEY = 'vizAddin_lastUrl';
+    const CONTENT_KEY = 'vizContent';
     const MAX_FAVORITES = 10;
+    const MAX_SETTINGS_SIZE = 1900000;
 
     // MSAL / Graph API
     const CLIENT_ID = 'edcce314-4b24-4216-9f5b-b65f829e3aa2';
@@ -296,6 +324,7 @@
     let currentUrl = '';
     let isOfficeEnvironment = false;
     let msalInstance = null;
+    let loadedFileContent = null;
 
     // Office.js Einstiegspunkt — oder Browser-Fallback
     if (typeof Office !== 'undefined') {
@@ -336,9 +365,21 @@
             }
         });
 
+        document.getElementById('fileBtn').addEventListener('click', () => {
+            document.getElementById('fileInput').click();
+        });
+        document.getElementById('fileInput').addEventListener('change', handleFileSelect);
+        document.getElementById('spPickerBtn').addEventListener('click', launchSharePointPicker);
+
         document.getElementById('editBtn').addEventListener('click', showSetupView);
         document.getElementById('refreshBtn').addEventListener('click', () => {
-            if (currentUrl) loadVisualization(currentUrl);
+            if (loadedFileContent) {
+                const vizFrame = document.getElementById('vizFrame');
+                vizFrame.removeAttribute('src');
+                vizFrame.srcdoc = loadedFileContent;
+            } else if (currentUrl) {
+                loadVisualization(currentUrl);
+            }
         });
 
         document.getElementById('vizFrame').addEventListener('load', onFrameLoaded);
@@ -431,6 +472,214 @@
         return await response.text();
     }
 
+    // ===== SharePoint File Picker (v8) =====
+
+    function getSharePointBaseUrl() {
+        if (isOfficeEnvironment) {
+            try {
+                const docUrl = Office.context.document.url;
+                if (docUrl && docUrl.includes('.sharepoint.com')) {
+                    return new URL(docUrl).origin;
+                }
+            } catch (e) {}
+        }
+        const cached = localStorage.getItem('vizAddin_spBaseUrl');
+        if (cached) return cached;
+        const baseUrl = prompt('SharePoint URL (e.g. https://company.sharepoint.com):');
+        if (baseUrl) {
+            const cleaned = baseUrl.replace(/\/+$/, '');
+            localStorage.setItem('vizAddin_spBaseUrl', cleaned);
+            return cleaned;
+        }
+        return null;
+    }
+
+    async function launchSharePointPicker() {
+        if (!msalInstance) {
+            showError('SharePoint browser requires authentication. MSAL not available.');
+            return;
+        }
+        const baseUrl = getSharePointBaseUrl();
+        if (!baseUrl) return;
+
+        const channelId = crypto.randomUUID();
+        const pickerOptions = {
+            sdk: "8.0",
+            entry: { oneDrive: { files: {} } },
+            authentication: {},
+            messaging: { origin: window.location.origin, channelId: channelId },
+            typesAndSources: {
+                mode: "files",
+                filters: [".html", ".htm"],
+                pivots: { oneDrive: true, recent: true, sharedLibraries: true }
+            },
+            selection: { mode: "single" }
+        };
+
+        const win = window.open("", "SharePointPicker", "width=1080,height=680");
+        if (!win) {
+            showError('Popup blocked. Please allow popups for this add-in.');
+            return;
+        }
+
+        try {
+            const authToken = await getPickerToken({ resource: baseUrl, type: "SharePoint" });
+            const queryString = new URLSearchParams({
+                filePicker: JSON.stringify(pickerOptions)
+            });
+            const pickerUrl = baseUrl + "/_layouts/15/FilePicker.aspx?" + queryString;
+
+            const form = win.document.createElement("form");
+            form.setAttribute("action", pickerUrl);
+            form.setAttribute("method", "POST");
+            win.document.body.append(form);
+
+            const input = win.document.createElement("input");
+            input.setAttribute("type", "hidden");
+            input.setAttribute("name", "access_token");
+            input.setAttribute("value", authToken);
+            form.appendChild(input);
+            form.submit();
+        } catch (error) {
+            win.close();
+            showError('SharePoint authentication failed: ' + error.message);
+            return;
+        }
+
+        window.addEventListener("message", function onMessage(event) {
+            if (event.source !== win) return;
+            const message = event.data;
+            if (message.type === "initialize" && message.channelId === channelId) {
+                window.removeEventListener("message", onMessage);
+                const port = event.ports[0];
+                port.addEventListener("message", function(msg) {
+                    handlePickerCommand(msg, port, win);
+                });
+                port.start();
+                port.postMessage({ type: "activate" });
+            }
+        });
+    }
+
+    async function handlePickerCommand(message, port, win) {
+        const payload = message.data;
+        if (payload.type !== "command") return;
+
+        port.postMessage({ type: "acknowledge", id: payload.id });
+        const command = payload.data;
+
+        switch (command.command) {
+            case "authenticate":
+                try {
+                    const token = await getPickerToken(command);
+                    port.postMessage({ type: "result", id: payload.id,
+                        data: { result: "token", token: token } });
+                } catch (e) {
+                    port.postMessage({ type: "result", id: payload.id,
+                        data: { result: "error", error: { code: "authError", message: e.message } } });
+                }
+                break;
+            case "close":
+                win.close();
+                break;
+            case "pick":
+                if (command.items && command.items.length > 0) {
+                    const item = command.items[0];
+                    const fileUrl = item.webUrl || item.webDavUrl;
+                    if (fileUrl) {
+                        document.getElementById('vizUrl').value = fileUrl;
+                        handleLoadClick(fileUrl);
+                    }
+                }
+                port.postMessage({ type: "result", id: payload.id,
+                    data: { result: "success" } });
+                win.close();
+                break;
+            default:
+                port.postMessage({ type: "result", id: payload.id,
+                    data: { result: "error", error: { code: "unsupportedCommand", message: command.command } } });
+                break;
+        }
+    }
+
+    async function getPickerToken(command) {
+        if (!msalInstance) throw new Error('MSAL not available');
+        let scopes;
+        switch (command.type) {
+            case "SharePoint":
+            case "SharePoint_SelfIssued":
+                scopes = [command.resource + "/.default"];
+                break;
+            case "Graph":
+                scopes = ["https://graph.microsoft.com/.default"];
+                break;
+            default:
+                scopes = [command.resource + "/.default"];
+        }
+        const accounts = msalInstance.getAllAccounts();
+        const tokenRequest = { scopes: scopes };
+        if (accounts.length > 0) tokenRequest.account = accounts[0];
+        try {
+            const resp = await msalInstance.acquireTokenSilent(tokenRequest);
+            return resp.accessToken;
+        } catch (e) {
+            const resp = await msalInstance.acquireTokenPopup(tokenRequest);
+            return resp.accessToken;
+        }
+    }
+
+    // ===== Lokale Datei oeffnen =====
+
+    function handleFileSelect(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        if (!file.name.endsWith('.html') && !file.name.endsWith('.htm')) {
+            showError('Please select an HTML file (.html or .htm)');
+            return;
+        }
+
+        hideError();
+
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            loadedFileContent = e.target.result;
+            currentUrl = 'file://' + file.name;
+
+            if (isOfficeEnvironment) {
+                Office.context.document.settings.set(SETTINGS_KEY, currentUrl);
+
+                if (loadedFileContent.length <= MAX_SETTINGS_SIZE) {
+                    Office.context.document.settings.set(CONTENT_KEY, loadedFileContent);
+                    console.log('Dateiinhalt gespeichert in Document Settings (' +
+                        Math.round(loadedFileContent.length / 1024) + ' KB)');
+                } else {
+                    Office.context.document.settings.remove(CONTENT_KEY);
+                    console.warn('Datei zu gross fuer Document Settings (' +
+                        Math.round(loadedFileContent.length / 1024) + ' KB)');
+                    showError('File saved but too large to persist in presentation (' +
+                        Math.round(loadedFileContent.length / 1024) + ' KB). ' +
+                        'You will need to re-select it next time.');
+                }
+
+                Office.context.document.settings.saveAsync();
+            }
+
+            const vizFrame = document.getElementById('vizFrame');
+            vizFrame.removeAttribute('src');
+            vizFrame.srcdoc = loadedFileContent;
+            hideLoading();
+            showDisplayView();
+            console.log('Lokale Datei geladen:', file.name);
+        };
+        reader.onerror = function() {
+            showError('Could not read file.');
+        };
+        reader.readAsText(file);
+
+        event.target.value = '';
+    }
+
     // ===== URL laden und speichern =====
 
     function handleLoadClick(url) {
@@ -466,6 +715,11 @@
 
     async function loadVisualization(url) {
         const vizFrame = document.getElementById('vizFrame');
+        loadedFileContent = null;
+
+        if (isOfficeEnvironment) {
+            Office.context.document.settings.remove(CONTENT_KEY);
+        }
 
         if (isSharePointUrl(url)) {
             if (!msalInstance) {
@@ -573,6 +827,25 @@
 
         if (savedUrl) {
             currentUrl = savedUrl;
+
+            if (savedUrl.startsWith('file://') && isOfficeEnvironment) {
+                try {
+                    const savedContent = Office.context.document.settings.get(CONTENT_KEY);
+                    if (savedContent) {
+                        loadedFileContent = savedContent;
+                        const vizFrame = document.getElementById('vizFrame');
+                        vizFrame.removeAttribute('src');
+                        vizFrame.srcdoc = savedContent;
+                        showDisplayView();
+                        console.log('Gespeicherten Dateiinhalt wiederhergestellt:', savedUrl);
+                        return;
+                    }
+                } catch (e) {
+                    console.warn('Gespeicherter Dateiinhalt nicht verfuegbar:', e);
+                }
+                return;
+            }
+
             loadVisualization(savedUrl);
         }
     }
